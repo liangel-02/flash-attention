@@ -2523,3 +2523,66 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("num_splits", [0, 3])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_paged_kv_splitkv(num_splits, dtype):
+    """The combine kernel must use cu_seqlens_q (not o_batch_stride) for varlen."""
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    device = "cuda"
+    num_heads, num_heads_k, head_dim = 4, 2, 64
+    page_block_size = 256
+    scale = head_dim ** -0.5
+
+    batch_size = 2
+    kv_lens = [512, 1024]
+    max_seqlen_k = max(kv_lens)
+
+    max_blocks_per_seq = max(
+        (s + page_block_size - 1) // page_block_size for s in kv_lens
+    )
+    total_blocks = batch_size * max_blocks_per_seq
+    k_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+    v_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+
+    block_table = rearrange(
+        torch.randperm(total_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+
+    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0))
+
+    out_ref, _, _, _ = _flash_attn_varlen_forward(
+        q, k_cache, v_cache,
+        cu_seqlens_q, cu_seqlens_k,
+        1, max_seqlen_k,
+        0.0, scale,
+        causal=False, window_size_left=-1, window_size_right=0,
+        block_table=block_table, seqused_k=seqused_k,
+        num_splits=1,
+    )
+    assert not out_ref.isnan().any()
+
+    out_test, _, _, _ = _flash_attn_varlen_forward(
+        q, k_cache, v_cache,
+        cu_seqlens_q, cu_seqlens_k,
+        1, max_seqlen_k,
+        0.0, scale,
+        causal=False, window_size_left=-1, window_size_right=0,
+        block_table=block_table, seqused_k=seqused_k,
+        num_splits=num_splits,
+    )
+    assert not out_test.isnan().any()
+    torch.testing.assert_close(out_test, out_ref, rtol=1e-3, atol=1e-3)
